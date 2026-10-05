@@ -1,0 +1,268 @@
+package com.pickle.court.service;
+
+import com.pickle.court.model.Entities.*;
+import com.pickle.court.repo.Repos.BookingRepository;
+import com.pickle.court.repo.Repos.CourtRepository;
+import com.pickle.court.repo.Repos.PenaltyRepository;
+import com.pickle.court.repo.Repos.UserRepository;
+import com.pickle.court.web.Dtos.CancelResult;
+import com.pickle.court.web.Dtos.RescheduleRequest;
+import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
+import java.math.BigDecimal;
+import java.time.*;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Function;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class BookingServiceTest {
+
+    @Test
+    void availabilityMarksOverlappingSlotUnavailable() {
+        Court court = activeCourt();
+        Booking existing = booking(court, activeUser(), Instant.parse("2026-10-06T10:00:00Z"), Instant.parse("2026-10-06T11:00:00Z"));
+        BookingService service = service(courts(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(court);
+            default -> defaultValue(invocation.methodReturnType());
+        }), bookings(invocation -> switch (invocation.method()) {
+            case "findActiveForCourtBetween" -> List.of(existing);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> defaultValue(invocation.methodReturnType())), penalties(invocation -> defaultValue(invocation.methodReturnType())));
+
+        List<com.pickle.court.web.Dtos.SlotView> slots = service.availability(1L, LocalDate.of(2026, 10, 6));
+
+        assertEquals(14, slots.size());
+        assertFalse(slots.get(2).available());
+        assertTrue(slots.get(3).available());
+    }
+
+    @Test
+    void bookCreatesBookingWithCalculatedTotal() {
+        Court court = activeCourt();
+        AppUser user = activeUser();
+        Instant start = Instant.parse("2026-10-06T12:00:00Z");
+        BookingService service = service(courts(invocation -> switch (invocation.method()) {
+            case "findByIdForUpdate" -> Optional.of(court);
+            default -> defaultValue(invocation.methodReturnType());
+        }), bookings(invocation -> switch (invocation.method()) {
+            case "existsOverlap" -> false;
+            case "saveAndFlush" -> invocation.argument(0);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(user);
+            default -> defaultValue(invocation.methodReturnType());
+        }), penalties(invocation -> defaultValue(invocation.methodReturnType())));
+
+        Booking result = service.book(1L, 2L, start, 2, false);
+
+        assertEquals(BigDecimal.valueOf(60), result.getTotalPrice());
+        assertEquals(start.plus(Duration.ofHours(2)), result.getEndTime());
+        assertFalse(result.isCreatedByAdmin());
+    }
+
+    @Test
+    void bookRejectsSuspendedUserForNonAdminFlow() {
+        AppUser user = activeUser();
+        user.setStatus(UserStatus.SUSPENDED);
+        BookingService service = service(courts(invocation -> defaultValue(invocation.methodReturnType())), bookings(invocation -> defaultValue(invocation.methodReturnType())), users(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(user);
+            default -> defaultValue(invocation.methodReturnType());
+        }), penalties(invocation -> defaultValue(invocation.methodReturnType())));
+
+        ResponseStatusException ex = assertThrows(ResponseStatusException.class,
+                () -> service.book(1L, 2L, Instant.parse("2026-10-06T12:00:00Z"), 1, false));
+
+        assertEquals(HttpStatus.FORBIDDEN, ex.getStatusCode());
+    }
+
+    @Test
+    void rescheduleUpdatesCourtAndTime() {
+        Court originalCourt = activeCourt();
+        Court newCourt = activeCourt();
+        newCourt.setId(9L);
+        Booking booking = booking(originalCourt, activeUser(), Instant.parse("2026-10-08T12:00:00Z"), Instant.parse("2026-10-08T13:00:00Z"));
+        BookingService service = service(courts(invocation -> switch (invocation.method()) {
+            case "findByIdForUpdate" -> Optional.of(newCourt);
+            default -> defaultValue(invocation.methodReturnType());
+        }), bookings(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(booking);
+            case "existsOverlap" -> false;
+            case "saveAndFlush" -> invocation.argument(0);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> defaultValue(invocation.methodReturnType())), penalties(invocation -> defaultValue(invocation.methodReturnType())));
+
+        Booking result = service.reschedule(5L, 1L, false,
+                new RescheduleRequest(Instant.parse("2026-10-08T14:00:00Z"), 2, 9L));
+
+        assertSame(newCourt, result.getCourt());
+        assertEquals(Instant.parse("2026-10-08T14:00:00Z"), result.getStartTime());
+        assertEquals(Instant.parse("2026-10-08T16:00:00Z"), result.getEndTime());
+    }
+
+    @Test
+    void cancelAppliesLateFeeAndPenaltyRecord() {
+        Court court = activeCourt();
+        AppUser user = activeUser();
+        Booking booking = booking(court, user, Instant.now().plus(Duration.ofHours(5)), Instant.now().plus(Duration.ofHours(6)));
+        booking.setTotalPrice(BigDecimal.valueOf(100));
+        final Penalty[] savedPenalty = {null};
+        BookingService service = service(courts(invocation -> defaultValue(invocation.methodReturnType())), bookings(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(booking);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> defaultValue(invocation.methodReturnType())), penalties(invocation -> switch (invocation.method()) {
+            case "save" -> {
+                savedPenalty[0] = invocation.argument(0);
+                yield savedPenalty[0];
+            }
+            default -> defaultValue(invocation.methodReturnType());
+        }));
+
+        CancelResult result = service.cancel(7L, 1L, false, false);
+
+        assertEquals(BookingStatus.LATE_CANCELLED, result.status());
+        assertEquals(0, BigDecimal.valueOf(20).compareTo(result.penaltyAmount()));
+        assertEquals(1, user.getStrikeCount());
+        assertNotNull(savedPenalty[0]);
+        assertEquals(PenaltyType.LATE_CANCEL_FEE, savedPenalty[0].getType());
+    }
+
+    @Test
+    void markNoShowSuspendsUserAtStrikeLimit() {
+        Court court = activeCourt();
+        AppUser user = activeUser();
+        user.setStrikeCount(2);
+        Booking booking = booking(court, user, Instant.now().minus(Duration.ofHours(1)), Instant.now().plus(Duration.ofHours(1)));
+        BookingService service = service(courts(invocation -> defaultValue(invocation.methodReturnType())), bookings(invocation -> switch (invocation.method()) {
+            case "findById" -> Optional.of(booking);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> defaultValue(invocation.methodReturnType())), penalties(invocation -> switch (invocation.method()) {
+            case "save" -> invocation.argument(0);
+            default -> defaultValue(invocation.methodReturnType());
+        }));
+
+        Booking result = service.markNoShow(11L);
+
+        assertEquals(BookingStatus.NO_SHOW, result.getStatus());
+        assertEquals(UserStatus.SUSPENDED, user.getStatus());
+        assertEquals(3, user.getStrikeCount());
+    }
+
+    @Test
+    void completePastBookingsMarksOnlyExpiredConfirmedBookings() {
+        Court court = activeCourt();
+        AppUser user = activeUser();
+        Booking past = booking(court, user, Instant.now().minus(Duration.ofHours(3)), Instant.now().minus(Duration.ofHours(2)));
+        Booking future = booking(court, user, Instant.now().plus(Duration.ofHours(2)), Instant.now().plus(Duration.ofHours(3)));
+        BookingService service = service(courts(invocation -> defaultValue(invocation.methodReturnType())), bookings(invocation -> switch (invocation.method()) {
+            case "findSchedule" -> List.of(past, future);
+            default -> defaultValue(invocation.methodReturnType());
+        }), users(invocation -> defaultValue(invocation.methodReturnType())), penalties(invocation -> defaultValue(invocation.methodReturnType())));
+
+        int updated = service.completePastBookings();
+
+        assertEquals(1, updated);
+        assertEquals(BookingStatus.COMPLETED, past.getStatus());
+        assertEquals(BookingStatus.CONFIRMED, future.getStatus());
+    }
+
+    private static BookingService service(CourtRepository courts, BookingRepository bookings, UserRepository users, PenaltyRepository penalties) {
+        return new BookingService(bookings, courts, users, penalties,
+                "UTC", 8, 22, 4, 24, 20, 2, 50, 3);
+    }
+
+    private static Court activeCourt() {
+        Court court = new Court();
+        court.setId(2L);
+        court.setName("Court A");
+        court.setSurface("Hard");
+        court.setIndoor(true);
+        court.setHourlyRate(BigDecimal.valueOf(30));
+        court.setStatus(CourtStatus.ACTIVE);
+        return court;
+    }
+
+    private static AppUser activeUser() {
+        AppUser user = new AppUser();
+        user.setId(1L);
+        user.setEmail("player@example.com");
+        user.setFullName("Player One");
+        user.setPasswordHash("hash");
+        user.setRole(UserRole.PLAYER);
+        user.setStatus(UserStatus.ACTIVE);
+        user.setStrikeCount(0);
+        return user;
+    }
+
+    private static Booking booking(Court court, AppUser user, Instant start, Instant end) {
+        Booking booking = new Booking();
+        booking.setId(5L);
+        booking.setCourt(court);
+        booking.setUser(user);
+        booking.setStartTime(start);
+        booking.setEndTime(end);
+        booking.setStatus(BookingStatus.CONFIRMED);
+        booking.setTotalPrice(BigDecimal.valueOf(100));
+        booking.setCreatedByAdmin(false);
+        return booking;
+    }
+
+    private static CourtRepository courts(Function<Invocation, Object> handler) {
+        return proxy(CourtRepository.class, handler);
+    }
+
+    private static BookingRepository bookings(Function<Invocation, Object> handler) {
+        return proxy(BookingRepository.class, handler);
+    }
+
+    private static UserRepository users(Function<Invocation, Object> handler) {
+        return proxy(UserRepository.class, handler);
+    }
+
+    private static PenaltyRepository penalties(Function<Invocation, Object> handler) {
+        return proxy(PenaltyRepository.class, handler);
+    }
+
+    private static <T> T proxy(Class<T> type, Function<Invocation, Object> handler) {
+        InvocationHandler invocationHandler = (proxy, method, args) -> {
+            if (method.getDeclaringClass() == Object.class) {
+                return switch (method.getName()) {
+                    case "toString" -> type.getSimpleName() + "Proxy";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == args[0];
+                    default -> null;
+                };
+            }
+            Object result = handler.apply(new Invocation(method.getName(), method.getReturnType(), args == null ? new Object[0] : args));
+            if (result == null) {
+                return defaultValue(method.getReturnType());
+            }
+            return result;
+        };
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] { type }, invocationHandler));
+    }
+
+    private record Invocation(String method, Class<?> methodReturnType, Object[] args) {
+        @SuppressWarnings("unchecked")
+        <T> T argument(int index) { return (T) args[index]; }
+    }
+
+    private static Object defaultValue(Class<?> type) {
+        if (!type.isPrimitive()) return null;
+        if (type == boolean.class) return false;
+        if (type == byte.class) return (byte) 0;
+        if (type == short.class) return (short) 0;
+        if (type == int.class) return 0;
+        if (type == long.class) return 0L;
+        if (type == float.class) return 0f;
+        if (type == double.class) return 0d;
+        if (type == char.class) return '\0';
+        return null;
+    }
+}
